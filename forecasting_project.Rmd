@@ -1,0 +1,346 @@
+---
+title: "TÜİK Forecasting Project: Non-Domestic Producer Price Index"
+author: "Mehmet Zahid Kemik (138722034)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 5
+)
+
+required_packages <- c("tuikr", "dplyr", "knitr", "kableExtra", "readxl", "crul")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg == "tuikr") {
+      if (!requireNamespace("remotes", quietly = TRUE)) {
+        install.packages("remotes")
+      }
+      remotes::install_github("emraher/tuikr")
+    } else {
+      install.packages(pkg)
+    }
+  }
+}
+
+source("R/data_import.R")
+source("R/forecasting_methods.R")
+source("R/accuracy_measures.R")
+source("R/plots.R")
+
+if (!dir.exists("outputs/tables")) dir.create("outputs/tables", recursive = TRUE)
+if (!dir.exists("outputs/figures")) dir.create("outputs/figures", recursive = TRUE)
+```
+
+# Project Overview
+
+This project forecasts the next monthly observation of the **Non-Domestic Producer Price Index (2010=100)** published by TÜİK. This index tracks import prices in Türkiye and is closely related to exchange-rate pass-through and inflation dynamics.
+
+The analysis uses the `tuikr` package to access TÜİK data. When the SDMX endpoint returns an authorization error, the notebook automatically falls back to the official TÜİK portal table path documented in the `tuikr` package.
+
+# Data Source and TÜİK Connection
+
+```{r data-access}
+project_data <- load_project_series(lang = "en")
+raw_data <- project_data$raw_data
+series_tbl <- project_data$series
+target_info <- project_data$target
+access_date <- project_data$access_date
+meta <- project_data$meta
+
+knitr::kable(data.frame(
+  Field = c(
+    "TÜİK data set name",
+    "TÜİK theme / category",
+    "TÜİK table name",
+    "tuikr dataflow ID",
+    "Selected variable",
+    "Data frequency",
+    "Time coverage",
+    "Latest available observation",
+    "Forecast target period",
+    "Date of data access",
+    "Data access method"
+  ),
+  Value = c(
+    meta$dataset_name,
+    meta$theme,
+    meta$table_name,
+    meta$dataflow_id,
+    meta$selected_variable,
+    meta$frequency,
+    paste(format_period_label(min(series_tbl$period_date)), "to", format_period_label(max(series_tbl$period_date))),
+    target_info$latest_observation,
+    target_info$forecast_target_period,
+    as.character(access_date),
+    project_data$access_method
+  )
+))
+```
+
+The data were accessed through the `tuikr` package. The notebook first attempts `tuikr::statistical_data()` using the registered SDMX dataflow ID. If the SDMX service returns an authorization error, it uses `tuikr::statistical_tables()` to locate the official TÜİK portal table and downloads that table programmatically inside R without saving a separate data file to the repository.
+
+Package source: [https://github.com/emraher/tuikr](https://github.com/emraher/tuikr)
+
+```{r show-raw-head}
+knitr::kable(head(raw_data, 10))
+```
+
+# Use of TÜİK Data in R
+
+After importing the TÜİK table through `tuikr`, the notebook keeps only the **national monthly non-domestic producer price index level**. Rate-of-change indicators and disaggregated sub-indices are excluded so that the selected variable remains a single numeric time series suitable for forecasting.
+
+The main adjustments performed in R are:
+
+1. Selecting the non-domestic producer price index variable rather than monthly or annual change rates.
+2. Using `obsTime` as the period variable and converting it to monthly dates.
+3. Sorting observations chronologically and removing duplicate periods.
+4. Confirming that `obsValue` is numeric and checking for missing observations.
+
+```{r data-prep-summary}
+cat("Number of observations:", nrow(series_tbl), "\n")
+cat("First period:", format_period_label(min(series_tbl$period_date)), "\n")
+cat("Last period:", format_period_label(max(series_tbl$period_date)), "\n")
+cat("Any missing values:", any(is.na(series_tbl$value)), "\n")
+```
+
+# Exploratory Time Series Analysis
+
+```{r exploratory-plot, fig.cap="Actual monthly Non-Domestic Producer Price Index."}
+plot(
+  series_tbl$period_date,
+  series_tbl$value,
+  type = "l",
+  lwd = 2,
+  col = "#1f4e79",
+  xlab = "Period",
+  ylab = "Index (2010=100)",
+  main = "Non-Domestic Producer Price Index"
+)
+grid()
+```
+
+**Trend:** The series shows a strong upward trend, especially in recent years, which reflects imported inflation pressure in Türkiye.
+
+**Seasonality:** Monthly oscillations are visible. Because the data frequency is monthly, seasonal methods with a 12-month cycle are applicable.
+
+**Random variation:** Short-term fluctuations remain around the trend, indicating that no method fits perfectly without error.
+
+**Missing values / outliers:** The prepared series does not contain missing monthly periods in the filtered national index series. Extreme increases during high-inflation periods are economically meaningful rather than data errors.
+
+# Forecasting Methods Applied
+
+The following sections apply all required forecasting methods. Accuracy is evaluated on in-sample fitted or one-step-ahead values, while the next-period forecast uses the full sample.
+
+## 7.1 Naïve Forecasting
+
+```{r naive}
+method_results <- run_all_forecasting_methods(series_tbl)
+naive_result <- method_results$naive
+tail(data.frame(actual = naive_result$actual, forecast = naive_result$forecast), 5)
+calc_accuracy_measures(naive_result$actual, naive_result$forecast)
+```
+
+**Interpretation:** The naïve method assumes that the next value equals the most recent observation. It is simple, but it ignores trend and seasonality.
+
+## 7.2 Moving Average
+
+A **3-month window** is used because producer price inflation reacts quickly to recent shocks, while a longer window would over-smooth short-run dynamics.
+
+```{r moving-average}
+ma_result <- method_results$moving_average
+calc_accuracy_measures(ma_result$actual, ma_result$forecast)
+```
+
+**Interpretation:** The moving average smooths recent observations and reduces noise, but it reacts more slowly than exponential smoothing when the trend accelerates.
+
+## 7.3 Weighted Moving Average
+
+Weights **0.50, 0.30, 0.20** are applied to the three most recent months so that the latest observation receives the highest weight.
+
+```{r wma}
+wma_result <- method_results$weighted_moving_average
+wma_result$weights
+calc_accuracy_measures(wma_result$actual, wma_result$forecast)
+```
+
+**Interpretation:** Weighted averaging improves responsiveness to recent price changes compared with a simple moving average.
+
+## 7.4 Exponential Smoothing
+
+The smoothing parameter **alpha = 0.30** balances responsiveness and stability for a volatile monthly inflation-related index.
+
+```{r es}
+es_result <- method_results$exponential_smoothing
+calc_accuracy_measures(es_result$actual, es_result$forecast)
+```
+
+**Interpretation:** Exponential smoothing gives more weight to recent observations in a recursive way and performs better than the naïve method when the latest level is informative.
+
+## 7.5 Trend-Adjusted Exponential Smoothing
+
+The series displays a meaningful upward trend, so Holt-style smoothing is applicable with **alpha = 0.30** and **beta = 0.20**.
+
+```{r holt}
+holt_result <- method_results$trend_adjusted_smoothing
+calc_accuracy_measures(holt_result$actual, holt_result$forecast)
+```
+
+**Interpretation:** This method captures both level and trend, which is important for a producer price index under persistent inflation.
+
+## 7.6 Linear Trend Projection
+
+```{r linear-trend}
+lt_result <- method_results$linear_trend
+lt_result$equation
+summary(lt_result$model)
+calc_accuracy_measures(lt_result$actual, lt_result$forecast)
+```
+
+**Interpretation of intercept:** The intercept represents the estimated index level at the beginning of the sample period after accounting for the linear time trend.
+
+**Interpretation of slope:** The positive slope indicates that the total producer price index increases over time on average.
+
+## 7.7 Seasonal Indices
+
+Monthly data support a 12-season structure.
+
+```{r seasonal-indices}
+si_result <- method_results$seasonal_indices
+round(si_result$seasonal_index, 3)
+calc_accuracy_measures(si_result$actual, si_result$forecast)
+```
+
+**Interpretation:** Months with seasonal indices above 1.00 tend to have relatively higher producer price index levels after removing trend effects.
+
+## 7.8 Additive Decomposition
+
+```{r additive}
+add_result <- method_results$additive_decomposition
+calc_accuracy_measures(add_result$actual, add_result$forecast)
+```
+
+**Interpretation:** Additive decomposition separates trend, seasonal, and random components. It is suitable because seasonal swings are roughly stable relative to the level of the series.
+
+## 7.9 Multiplicative Decomposition
+
+```{r multiplicative}
+mult_result <- method_results$multiplicative_decomposition
+calc_accuracy_measures(mult_result$actual, mult_result$forecast)
+```
+
+**Interpretation:** Multiplicative decomposition is also applicable because all index values are positive and seasonal effects can widen as the series level rises.
+
+## 7.10 Regression with Trend and Seasonal Dummy Variables
+
+```{r regression-seasonal}
+reg_result <- method_results$regression_seasonal
+summary(reg_result$model)
+calc_accuracy_measures(reg_result$actual, reg_result$forecast)
+```
+
+**Interpretation:** The trend coefficient shows the average monthly change in the index, while seasonal dummy variables capture systematic month-specific deviations from trend.
+
+# Forecast Accuracy Comparison
+
+```{r comparison}
+next_forecasts <- extract_next_forecasts(method_results, series_tbl)
+comparison_tbl <- make_comparison_table(method_results, next_forecasts)
+knitr::kable(comparison_tbl, digits = 4)
+write.csv(comparison_tbl, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+```
+
+# Actual vs Forecast Plots
+
+```{r save-plots, include=FALSE}
+save_all_method_plots(series_tbl, method_results)
+```
+
+The plots are saved under `outputs/figures/`. The notebook displays representative comparisons below.
+
+```{r plot-grid, fig.cap="Actual vs forecast comparisons for selected methods.", out.width='100%'}
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+for (res in list(naive_result, ma_result, holt_result, reg_result)) {
+  plot_actual_vs_forecast(
+    series_tbl = series_tbl,
+    method_result = res,
+    save_path = tempfile(),
+    title = res$method
+  )
+}
+par(mfrow = c(1, 1))
+```
+
+# Selection of the Superior Method
+
+```{r superior-method}
+superior <- select_superior_method(comparison_tbl, method_results)
+superior$method
+superior$reason
+```
+
+The superior method is selected using both numerical accuracy and suitability to the data structure. A method with the lowest MAD is preferred only if it also matches the observed monthly trend and seasonality of the producer price index.
+
+# Final Next-Period Forecast
+
+```{r final-forecast}
+final_method_name <- superior$method
+final_key <- superior$method_key
+final_result <- method_results[[final_key]]
+final_forecast_value <- next_forecasts[[final_key]]
+
+final_tbl <- data.frame(
+  selected_superior_method = final_method_name,
+  date_of_data_access = as.character(access_date),
+  latest_available_observation = target_info$latest_observation,
+  forecast_target_period = target_info$forecast_target_period,
+  forecasted_value = round(final_forecast_value, 4),
+  mad = comparison_tbl$mad[comparison_tbl$method_key == final_key],
+  mape = comparison_tbl$mape[comparison_tbl$method_key == final_key]
+)
+
+knitr::kable(final_tbl, digits = 4)
+write.csv(final_tbl, "outputs/tables/final_forecast.csv", row.names = FALSE)
+
+plot_superior_method(
+  series_tbl = series_tbl,
+  method_result = final_result,
+  next_forecast = final_forecast_value,
+  target_period = target_info$forecast_target_period
+)
+```
+
+**Interpretation of the final forecast:** The selected model forecasts the Non-Domestic Producer Price Index for **`r target_info$forecast_target_period`** at **`r round(final_forecast_value, 2)`**. This suggests that imported producer price pressure is expected to continue along its recent trend, adjusted for monthly seasonality.
+
+# Limitations
+
+- The series is affected by exchange-rate pass-through, energy prices, and policy shocks that simple forecasting methods do not model explicitly.
+- TÜİK may revise previously published index values.
+- Structural breaks during high-inflation periods reduce the stability of historical patterns.
+- The project uses only the index level series and does not include explanatory macroeconomic variables.
+
+# Reproducibility Notes
+
+1. Clone the public GitHub repository.
+2. Open `forecasting_project.Rmd` in RStudio.
+3. Install required packages if prompted in the setup chunk.
+4. Knit the notebook to regenerate tables, figures, and the HTML report.
+5. All TÜİK data are downloaded live through `tuikr`; no manually prepared data files are used.
+
+# Author
+
+- **Name:** Mehmet Zahid Kemik
+- **Student Number:** 138722034
+- **Course:** Quantitative Analysis
